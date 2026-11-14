@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="nettune-token" content="__NETTUNE_TOKEN__">
+  <title>NetTune</title>
+  <link rel="icon" href="logo.svg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="logo.svg" alt="" width="26" height="26">
+      <span class="brand-name">NetTune</span>
+      <span class="version" id="version"></span>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="Sections">
+      <button role="tab" data-tab="diagnose" aria-selected="true">Diagnose</button>
+      <button role="tab" data-tab="fixes" aria-selected="false">Fixes</button>
+      <button role="tab" data-tab="combine" aria-selected="false">Combine</button>
+      <button role="tab" data-tab="profiles" aria-selected="false">Profiles</button>
+      <button role="tab" data-tab="history" aria-selected="false">History</button>
+    </nav>
+    <div class="rights" id="rights"></div>
+  </header>
+
+  <main>
+    <div id="notice"></div>
+
+    <section class="tab" id="tab-diagnose" role="tabpanel">
+      <div class="card" id="conn"><p class="muted">Reading your connection…</p></div>
+
+      <div class="card run-card">
+        <div class="run-head">
+          <div>
+            <h2>Find what is slowing you down</h2>
+            <p class="muted">Tests the Wi-Fi link, the router, the internet beyond it, DNS and background usage, then tells you which part is the bottleneck.</p>
+          </div>
+          <div class="run-controls">
+            <label class="check"><input type="checkbox" id="opt-speed" checked> Speed test</label>
+            <select id="opt-mode" aria-label="Speed test size">
+              <option value="full">Full — up to 300 MB of data</option>
+              <option value="lite">Light — about 13 MB (hotspot)</option>
+            </select>
+            <button class="btn primary" id="run">Run diagnosis</button>
+          </div>
+        </div>
+        <ol class="steps" id="steps" hidden></ol>
+      </div>
+
+      <div id="verdict"></div>
+      <div class="tiles" id="tiles"></div>
+      <div id="findings"></div>
+      <div class="grid2">
+        <div class="card" id="dns-card" hidden></div>
+        <div class="card" id="latency-card" hidden></div>
+      </div>
+      <div class="card" id="nearby-card" hidden></div>
+      <div class="card" id="background-card" hidden></div>
+    </section>
+
+    <section class="tab" id="tab-fixes" role="tabpanel" hidden>
+      <div class="section-head">
+        <div>
+          <h2>Fixes</h2>
+          <p class="muted">Each fix changes one setting, saves the original first, and can be reverted with one click.</p>
+        </div>
+        <button class="btn" id="fixes-refresh">Refresh</button>
+      </div>
+      <div id="fixes-list" class="stack"></div>
+      <h3>One-time actions</h3>
+      <div id="actions-list" class="stack"></div>
+    </section>
+
+    <section class="tab" id="tab-combine" role="tabpanel" hidden>
+      <div class="section-head">
+        <div>
+          <h2>Combine connections</h2>
+          <p class="muted">Use campus Wi-Fi and your phone's mobile data at the same time. NetTune spreads your connections across both, so browsing, multi-part downloads and several apps at once get the sum of the two.</p>
+        </div>
+        <button class="btn" id="combine-refresh">Refresh</button>
+      </div>
+      <div class="card" id="combine-card"><p class="muted">Looking for connections…</p></div>
+      <div class="card">
+        <h2>How to connect both</h2>
+        <ol class="howto">
+          <li>Stay connected to the Wi-Fi network on this laptop.</li>
+          <li>Plug your phone in with a USB cable and turn on <b>USB tethering</b> in the phone's hotspot settings. A Wi-Fi hotspot will not work for this: one Wi-Fi card can join only one Wi-Fi network at a time.</li>
+          <li>Press Refresh. Both connections should appear above as online.</li>
+          <li>Press Start combining.</li>
+        </ol>
+        <p class="muted small">Good to know: one single stream (one file over one connection) still travels over one link, so it is not faster than that link. Combining uses your mobile data. If a website signs you out or refuses to load, stop combining for that site.</p>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-profiles" role="tabpanel" hidden>
+      <div class="section-head">
+        <div>
+          <h2>Profiles</h2>
+          <p class="muted">A profile is a set of fixes for one kind of network. Applying it turns its fixes on and reverts NetTune fixes it leaves out.</p>
+        </div>
+      </div>
+      <div class="card" id="binding-card"></div>
+      <div id="profiles-list" class="grid2"></div>
+    </section>
+
+    <section class="tab" id="tab-history" role="tabpanel" hidden>
+      <div class="section-head">
+        <div>
+          <h2>History</h2>
+          <p class="muted">Every diagnosis is saved here so you can compare numbers before and after a change. Arrows compare with the previous run on the same network.</p>
+        </div>
+        <button class="btn" id="history-clear">Clear history</button>
+      </div>
+      <div class="card" id="history-card"></div>
+    </section>
+  </main>
+
+  <footer>
+    <span>NetTune runs only on this computer. Nothing leaves it except the test traffic itself.</span>
+    <button class="linkish" id="quit">Quit NetTune</button>
+  </footer>
+
+  <div id="toasts" aria-live="polite"></div>
+  <div id="overlay" hidden><div class="overlay-box"><div class="spinner"></div><p id="overlay-text"></p></div></div>
+  <script src="app.js"></script>
+</body>
+</html>
