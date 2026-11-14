@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import ipaddress
+import re
 import select
 import socket
 import socketserver
@@ -33,6 +34,10 @@ STICKY_SECONDS = 600
 STICKY_SLACK = 2  # how much busier (weighted open connections) the sticky uplink may be
 MIN_WEIGHT = 0.1
 CAPACITY_DECAY = 0.995  # per second: an old speed record fades in a few minutes
+AVOID_SECONDS = 1800    # how long a host stays off a link that failed it
+STALL_BYTES = 256 * 1024  # an upload this far in with no answer counts as "mid-upload"
+SEND_TIMEOUT = 60
+HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{1,251})[a-z0-9]$")
 DOWN_AFTER_FAILURES = 4
 DOWN_SECONDS = 30
 IDLE_SECONDS = 300
@@ -140,6 +145,17 @@ class Balancer:
         self.uplinks = uplinks
         self.lock = threading.Lock()
         self._sticky: dict[str, tuple[Uplink, float]] = {}
+        self.rules: dict[str, str] = {}                 # domain -> uplink name ("always use this link")
+        self._avoid: dict[tuple[str, str], float] = {}  # (host, uplink name) -> avoid until
+        self.hosts: dict[str, dict] = {}                # per-host traffic, for the dashboard
+
+    def rule_for(self, host: str) -> str | None:
+        """The link a host is pinned to: the longest matching domain wins."""
+        best = None
+        for domain, name in self.rules.items():
+            if (host == domain or host.endswith("." + domain)) and (best is None or len(domain) > len(best[0])):
+                best = (domain, name)
+        return best[1] if best else None
 
     def _ranked(self, host: str, now: float, tried=()) -> list[Uplink]:
         """Uplinks to try for ``host``, best first. Caller holds the lock."""
@@ -161,6 +177,18 @@ class Balancer:
                 and score[sticky[0]] - score[ranked[0]] < STICKY_SLACK):
             ranked.remove(sticky[0])
             ranked.insert(0, sticky[0])
+        # A host that recently failed on a link (blocked site, upload cut off
+        # by a firewall) is tried on the other link first.
+        avoided = [u for u in ranked if self._avoid.get((host, u.name), 0) > now]
+        if avoided and len(avoided) < len(ranked):
+            ranked = [u for u in ranked if u not in avoided] + avoided
+        # A site the user pinned to a link always tries that link first.
+        pinned = self.rule_for(host)
+        for uplink in ranked:
+            if uplink.name == pinned:
+                ranked.remove(uplink)
+                ranked.insert(0, uplink)
+                break
         return ranked
 
     def order(self, host: str, now: float | None = None) -> list[Uplink]:
@@ -190,10 +218,12 @@ class Balancer:
                 self._sticky.clear()
             self._sticky[host] = (uplink, time.time())
 
-    def failed(self, uplink: Uplink) -> None:
+    def failed(self, uplink: Uplink, host: str | None = None) -> None:
         """The reserved connection could not be opened."""
         with self.lock:
             uplink.active = max(0, uplink.active - 1)
+            if host:
+                self._avoid[(host, uplink.name)] = time.time() + AVOID_SECONDS
             uplink.failures += 1
             if uplink.failures >= DOWN_AFTER_FAILURES:
                 uplink.down_until = time.time() + DOWN_SECONDS
@@ -203,10 +233,46 @@ class Balancer:
         with self.lock:
             uplink.active = max(0, uplink.active - 1)
 
-    def count(self, uplink: Uplink, down: int = 0, up: int = 0) -> None:
+    def trouble(self, host: str, uplink: Uplink) -> None:
+        """A connection to ``host`` broke mid-upload on this link: steer the retry elsewhere."""
+        with self.lock:
+            self._avoid[(host, uplink.name)] = time.time() + AVOID_SECONDS
+            self._sticky.pop(host, None)
+            self._host(host, uplink)["problems"] += 1
+
+    def _host(self, host: str, uplink: Uplink) -> dict:
+        entry = self.hosts.get(host)
+        if entry is None:
+            if len(self.hosts) >= 400:  # forget the hosts not seen for longest
+                for old in sorted(self.hosts, key=lambda h: self.hosts[h]["seen"])[:100]:
+                    del self.hosts[old]
+            entry = self.hosts[host] = {"up": 0, "down": 0, "problems": 0, "link": uplink.name, "seen": 0.0}
+        entry["link"], entry["seen"] = uplink.name, time.time()
+        return entry
+
+    def hosts_report(self, limit: int = 15) -> list[dict]:
+        now = time.time()
+        with self.lock:
+            names = sorted(self.hosts, key=lambda h: self.hosts[h]["seen"], reverse=True)[:limit]
+            rows = [{
+                "host": host, **{k: self.hosts[host][k] for k in ("up", "down", "problems", "link")},
+                "pinned": self.rule_for(host),
+                "avoiding": [u.name for u in self.uplinks if self._avoid.get((host, u.name), 0) > now],
+            } for host in names]
+            seen = set(names)
+            for domain, name in self.rules.items():
+                if domain not in seen:
+                    rows.append({"host": domain, "up": 0, "down": 0, "problems": 0, "link": None, "pinned": name, "avoiding": []})
+            return rows
+
+    def count(self, uplink: Uplink, down: int = 0, up: int = 0, host: str | None = None) -> None:
         with self.lock:
             uplink.bytes_down += down
             uplink.bytes_up += up
+            if host:
+                entry = self._host(host, uplink)
+                entry["down"] += down
+                entry["up"] += up
             now = time.time()
             uplink._window_bytes += down + up
             elapsed = now - uplink._window_start
@@ -304,8 +370,8 @@ class _Handler(socketserver.BaseRequestHandler):
                 if prefix:
                     upstream.sendall(prefix)
                     if uplink:
-                        combiner.balancer.count(uplink, up=len(prefix))
-                self._relay(client, upstream, uplink, combiner.balancer)
+                        combiner.balancer.count(uplink, up=len(prefix), host=host)
+                self._relay(client, upstream, uplink, combiner.balancer, host)
             finally:
                 upstream.close()
                 if uplink:
@@ -314,25 +380,48 @@ class _Handler(socketserver.BaseRequestHandler):
             return
 
     @staticmethod
-    def _relay(client, upstream, uplink, balancer) -> None:
-        client.settimeout(None)
-        upstream.settimeout(None)
+    def _relay(client, upstream, uplink, balancer, host) -> None:
+        client.settimeout(SEND_TIMEOUT)
+        upstream.settimeout(SEND_TIMEOUT)
+        unanswered = 0  # bytes sent up since the server last said anything
+
+        def broke_mid_upload() -> None:
+            # Resets are normal on idle connections; only one that cuts off a
+            # sizeable upload says "this link cannot carry uploads to this host".
+            if uplink and unanswered > STALL_BYTES:
+                balancer.trouble(host, uplink)
+
         while True:
             readable, _, _ = select.select([client, upstream], [], [], IDLE_SECONDS)
             if not readable:
                 return
             for source in readable:
-                data = source.recv(65536)
-                if not data:
-                    return
                 if source is client:
-                    upstream.sendall(data)
+                    data = client.recv(65536)
+                    if not data:
+                        broke_mid_upload()  # the app gave up waiting
+                        return
+                    try:
+                        upstream.sendall(data)
+                    except OSError:
+                        broke_mid_upload()
+                        return
+                    unanswered += len(data)
                     if uplink:
-                        balancer.count(uplink, up=len(data))
+                        balancer.count(uplink, up=len(data), host=host)
                 else:
+                    try:
+                        data = upstream.recv(65536)
+                    except OSError:
+                        broke_mid_upload()
+                        return
+                    if not data:
+                        broke_mid_upload()
+                        return
+                    unanswered = 0
                     client.sendall(data)
                     if uplink:
-                        balancer.count(uplink, down=len(data))
+                        balancer.count(uplink, down=len(data), host=host)
 
 
 class _ProxyServer(socketserver.ThreadingTCPServer):
@@ -416,7 +505,7 @@ class Combiner:
             try:
                 sock = socket.create_connection(address, timeout=8, source_address=(uplink.ip, 0))
             except OSError:
-                self.balancer.failed(uplink)
+                self.balancer.failed(uplink, host)
                 tried.append(uplink)
                 continue
             self.balancer.opened(uplink, host)
@@ -434,6 +523,7 @@ class Combiner:
                     f"Combining needs {minimum} working internet connections, but only {len(online)} "
                     "was found. Plug the phone in by USB and turn on USB tethering, then try again.")
             self.balancer = Balancer(online)
+            self.balancer.rules = dict(self.store.get("combine_rules", {}))
             last_error = None
             for candidate in range(port, port + 10):
                 try:
@@ -485,6 +575,26 @@ class Combiner:
             finally:
                 self._stop_server()
 
+    def set_rule(self, domain: str, uplink_name: str | None) -> None:
+        """Pin a site to one link (or clear the pin with ``None``)."""
+        domain = (domain or "").strip().lower().strip(".")
+        if not HOST_RE.match(domain):
+            raise CombineError("That is not a valid site name.")
+        if uplink_name is not None and uplink_name not in [u.name for u in self.balancer.uplinks]:
+            raise CombineError("Unknown connection.")
+
+        def update(rules):
+            if uplink_name is None:
+                rules.pop(domain, None)
+            else:
+                rules[domain] = uplink_name
+            return rules
+
+        rules = self.store.update("combine_rules", {}, update)
+        with self.balancer.lock:
+            self.balancer.rules = dict(rules)
+            self.balancer._sticky.pop(domain, None)
+
     def status(self) -> dict:
         if self.running:
             uplinks = self.balancer.uplinks
@@ -497,4 +607,5 @@ class Combiner:
             "system_proxy": self.system_proxy,
             "ready": sum(1 for u in uplinks if u.online) >= 2,
             "uplinks": [u.describe() for u in uplinks],
+            "hosts": self.balancer.hosts_report() if self.running else [],
         }

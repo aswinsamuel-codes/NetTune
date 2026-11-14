@@ -585,7 +585,36 @@ function renderCombine(status) {
     detail ? el('div', { class: 'combine-total', text: detail }) : null,
     status.uplinks.length ? el('div', { class: 'table-wrap' }, el('table', {},
       el('thead', {}, el('tr', {}, el('th', { text: 'Connection' }), el('th', { text: 'State' }), el('th', { class: 'num', text: 'Latency' }), el('th', { class: 'num', text: 'Open now' }), el('th', { class: 'num', text: 'Down' }), el('th', { class: 'num', text: 'Up' }), el('th', { class: 'num', text: 'Data used' }))),
-      el('tbody', {}, rows))) : el('div', { class: 'hint', text: 'No internet connection found.' }));
+      el('tbody', {}, rows))) : el('div', { class: 'hint', text: 'No internet connection found.' }),
+    status.running ? renderSites(status) : null);
+}
+
+function renderSites(status) {
+  const mb = (bytes) => `${num(bytes / 1e6, 2)} MB`;
+  const rows = (status.hosts || []).map((site) => {
+    const select = el('select', { 'aria-label': `Connection for ${site.host}`, onchange: async (event) => {
+      try {
+        renderCombine(await api('POST', '/api/combine/rule', { host: site.host, uplink: event.target.value || null }));
+        toast(event.target.value ? `${site.host} now always uses ${event.target.value}.` : `${site.host} is back on automatic.`, 'good');
+      } catch (err) { toast(err.message, 'bad'); }
+    } }, el('option', { value: '', text: 'Automatic' }),
+      status.uplinks.map((u) => el('option', { value: u.name, text: `Always ${u.name}`, selected: site.pinned === u.name })));
+    const note = site.problems
+      ? pill('warn', `Upload failed ${site.problems}×${site.avoiding.length ? `, avoiding ${site.avoiding.join(', ')}` : ''}`)
+      : site.avoiding.length ? pill('info', `Avoiding ${site.avoiding.join(', ')}`) : null;
+    return el('tr', {},
+      el('td', {}, site.host, note ? el('div', { style: { marginTop: '4px' } }, note) : null),
+      el('td', { text: site.link || '—' }),
+      el('td', { class: 'num', text: mb(site.up) }),
+      el('td', { class: 'num', text: mb(site.down) }),
+      el('td', {}, select));
+  });
+  return el('div', { style: { marginTop: '18px' } },
+    el('h2', { text: 'Sites' }),
+    el('p', { class: 'muted small', text: 'Most recent first. If an upload fails on one connection, NetTune sends the retry through the other. You can also pin a site to one connection.' }),
+    rows.length ? el('div', { class: 'table-wrap' }, el('table', {},
+      el('thead', {}, el('tr', {}, el('th', { text: 'Site' }), el('th', { text: 'Last used' }), el('th', { class: 'num', text: 'Sent' }), el('th', { class: 'num', text: 'Received' }), el('th', { text: 'Connection' }))),
+      el('tbody', {}, rows))) : el('p', { class: 'muted small', text: 'No traffic yet.' }));
 }
 
 async function startCombine(event) {

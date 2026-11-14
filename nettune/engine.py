@@ -243,6 +243,13 @@ class Engine:
         self.history.add_event(f"Combine started: {names}.", self.connection().get("label"))
         return status
 
+    def combine_rule(self, body: dict) -> dict:
+        try:
+            self.combiner.set_rule(str(body.get("host") or ""), body.get("uplink") or None)
+        except combine.CombineError as exc:
+            raise ApiError(400, str(exc), "combine_failed") from exc
+        return self.combine_status()
+
     def combine_stop(self) -> dict:
         self.combiner.stop()
         self.history.add_event("Combine stopped.", self.connection().get("label"))
@@ -288,6 +295,7 @@ class Engine:
             ("POST", "/api/test/speed"): self.test_speed,
             ("POST", "/api/analyze"): self.analyze,
             ("POST", "/api/combine/start"): self.combine_start,
+            ("POST", "/api/combine/rule"): self.combine_rule,
             ("POST", "/api/profiles/bind"): self.profile_bind,
             ("POST", "/api/profiles/auto"): self.profile_auto,
         }

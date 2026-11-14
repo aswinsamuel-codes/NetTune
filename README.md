@@ -65,6 +65,8 @@ NetTune runs a local proxy (HTTP and SOCKS5, on `127.0.0.1` only) and sends each
 - It can set the Windows proxy to itself so browsers and most apps use it. Your previous proxy setting is restored when you stop, when NetTune exits, or the next time it starts after a crash.
 - It uses your mobile data.
 
+**Blocked sites and failed uploads.** Campus networks often block some sites outright. The **Sites** list in the Combine tab shows which link each site used. When a connection to a site fails on one link, or an upload is cut off partway, NetTune sends that site through the other link for the next 30 minutes. You can also pin a site to one link for good. Example: a campus that blocks `epicgames.com` breaks uploads to Fab, so pin `epicgames.com` and `fab.com` to the phone link. A pin covers subdomains.
+
 ## Profiles
 
 A profile is a set of fixes for one kind of network. Two are built in, **College Wi-Fi** and **Phone hotspot**, and you can change which fixes each contains. Tie a profile to a network name and NetTune applies it automatically when you join that network (while the engine is running).

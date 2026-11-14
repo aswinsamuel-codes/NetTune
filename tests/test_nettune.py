@@ -250,6 +250,21 @@ class Balancing(unittest.TestCase):
         self.assertEqual(picks.count(self.phone), 5)
         self.assertEqual(picks.count(self.wifi), 1)
 
+    def test_broken_upload_moves_host_to_other_link(self):
+        first = self._open("upload.example")
+        self.balancer.closed(first)
+        self.balancer.trouble("upload.example", first)
+        self.assertIsNot(self.balancer.order("upload.example")[0], first)
+        self.assertEqual(self.balancer.hosts_report()[0]["problems"], 1)
+
+    def test_pinned_site_uses_its_link_even_when_busy(self):
+        self.balancer.rules = {"fab.example": "Phone"}
+        for i in range(5):
+            self.balancer.opened(self.phone, f"h{i}.example"); self.phone.active += 1
+        self.assertIs(self.balancer.order("cdn.fab.example")[0], self.phone)
+        self.assertIs(self.balancer.order("fab.example")[0], self.phone)
+        self.assertIs(self.balancer.order("notfab.example")[0], self.wifi)
+
     def test_counters(self):
         uplink = self._open("a.example")
         self.balancer.count(uplink, down=100, up=7)
