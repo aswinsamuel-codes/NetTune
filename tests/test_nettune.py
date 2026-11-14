@@ -205,17 +205,28 @@ class Balancing(unittest.TestCase):
         self.phone = Uplink(2, "Phone", "192.168.42.5")
         self.balancer = Balancer([self.wifi, self.phone])
 
-    def test_spreads_by_open_connections(self):
-        first = self.balancer.order("a.example")[0]
-        self.balancer.opened(first, "a.example")
-        second = self.balancer.order("b.example")[0]
-        self.assertIsNot(first, second)
+    def _open(self, host):
+        uplink = self.balancer.reserve(host)
+        self.balancer.opened(uplink, host)
+        return uplink
+
+    def test_simultaneous_connections_alternate(self):
+        # reserve() counts at once, so six connections starting together split 3/3.
+        picks = [self.balancer.reserve(f"host{i}.example") for i in range(6)]
+        self.assertEqual(picks.count(self.wifi), 3)
+        self.assertEqual(picks.count(self.phone), 3)
 
     def test_host_sticks_to_its_uplink(self):
-        self.balancer.opened(self.phone, "bank.example")
-        self.balancer.opened(self.phone, "other.example")
-        self.assertIs(self.balancer.order("bank.example")[0], self.phone)
-        self.assertIs(self.balancer.order("new.example")[0], self.wifi)
+        first = self._open("bank.example")
+        self.balancer.closed(first)
+        other = self._open("other.example")  # same link again: fewest total connections is the other one
+        self.assertIsNot(other, first)
+        self.assertIs(self.balancer.order("bank.example")[0], first)
+
+    def test_parallel_connections_to_one_host_spill_over(self):
+        picks = [self.balancer.reserve("cdn.example") for _ in range(6)]
+        self.assertGreaterEqual(picks.count(self.wifi), 2)
+        self.assertGreaterEqual(picks.count(self.phone), 2)
 
     def test_failing_uplink_is_rested_but_never_all(self):
         for _ in range(4):
@@ -225,11 +236,25 @@ class Balancing(unittest.TestCase):
             self.balancer.failed(self.wifi)
         self.assertEqual(len(self.balancer.order("x.example")), 2)  # all down: still try
 
+    def test_failed_connect_moves_to_the_other_uplink(self):
+        first = self.balancer.reserve("a.example")
+        self.balancer.failed(first)
+        second = self.balancer.reserve("a.example", [first])
+        self.assertIsNot(first, second)
+        self.assertEqual(first.active, 0)
+        self.assertIsNone(self.balancer.reserve("a.example", [first, second]))
+
+    def test_faster_link_gets_more_connections(self):
+        self.wifi.capacity, self.phone.capacity = 1_000_000, 5_000_000
+        picks = [self.balancer.reserve(f"host{i}.example") for i in range(6)]
+        self.assertEqual(picks.count(self.phone), 5)
+        self.assertEqual(picks.count(self.wifi), 1)
+
     def test_counters(self):
-        self.balancer.opened(self.wifi, "a.example")
-        self.balancer.count(self.wifi, down=100, up=7)
-        self.balancer.closed(self.wifi)
-        self.assertEqual((self.wifi.active, self.wifi.connections, self.wifi.bytes_down, self.wifi.bytes_up), (0, 1, 100, 7))
+        uplink = self._open("a.example")
+        self.balancer.count(uplink, down=100, up=7)
+        self.balancer.closed(uplink)
+        self.assertEqual((uplink.active, uplink.connections, uplink.bytes_down, uplink.bytes_up), (0, 1, 100, 7))
 
 
 class StoreTests(unittest.TestCase):

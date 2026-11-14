@@ -30,6 +30,9 @@ from .system import IS_WINDOWS, CommandError, as_list, run_ps_json
 
 DEFAULT_PORT = 8766
 STICKY_SECONDS = 600
+STICKY_SLACK = 2  # how much busier (weighted open connections) the sticky uplink may be
+MIN_WEIGHT = 0.1
+CAPACITY_DECAY = 0.995  # per second: an old speed record fades in a few minutes
 DOWN_AFTER_FAILURES = 4
 DOWN_SECONDS = 30
 IDLE_SECONDS = 300
@@ -74,6 +77,9 @@ class Uplink:
         self.bytes_down = 0
         self.bytes_up = 0
         self.failures = 0        # consecutive connect failures
+        self.capacity = 0.0      # fastest rate seen recently, bytes/s (0 = not measured yet)
+        self._window_bytes = 0
+        self._window_start = 0.0
         self.down_until = 0.0
 
     def usable(self, now: float) -> bool:
@@ -86,6 +92,7 @@ class Uplink:
             "online": self.online, "latency_ms": self.latency_ms,
             "active": self.active, "connections": self.connections,
             "bytes_down": self.bytes_down, "bytes_up": self.bytes_up,
+            "capacity_mbps": round(self.capacity * 8 / 1e6, 2),
             "down": time.time() < self.down_until,
         }
 
@@ -134,21 +141,49 @@ class Balancer:
         self.lock = threading.Lock()
         self._sticky: dict[str, tuple[Uplink, float]] = {}
 
+    def _ranked(self, host: str, now: float, tried=()) -> list[Uplink]:
+        """Uplinks to try for ``host``, best first. Caller holds the lock."""
+        candidates = [u for u in self.uplinks if u not in tried]
+        usable = [u for u in candidates if u.usable(now)] or candidates
+        # Weight each link by the fastest rate it has shown, so a link that is
+        # five times faster receives about five times the connections. Until a
+        # link has carried traffic all weights are equal. A slow link never
+        # drops below MIN_WEIGHT, so it keeps contributing.
+        top = max((u.capacity for u in usable), default=0.0)
+        weight = {u: (max(u.capacity / top, MIN_WEIGHT) if top > 0 and u.capacity > 0 else 1.0) for u in usable}
+        score = {u: (u.active + 1) / weight[u] for u in usable}
+        ranked = sorted(usable, key=lambda u: (score[u], u.connections))
+        sticky = self._sticky.get(host)
+        # Keep a host on its uplink for sequential use (logins are tied to an
+        # IP), but let parallel connections to one host spill over to the
+        # other link - that is what makes a multi-part download add up.
+        if (sticky and now - sticky[1] < STICKY_SECONDS and sticky[0] in usable
+                and score[sticky[0]] - score[ranked[0]] < STICKY_SLACK):
+            ranked.remove(sticky[0])
+            ranked.insert(0, sticky[0])
+        return ranked
+
     def order(self, host: str, now: float | None = None) -> list[Uplink]:
-        """Uplinks to try for ``host``, best first."""
-        now = time.time() if now is None else now
         with self.lock:
-            usable = [u for u in self.uplinks if u.usable(now)] or list(self.uplinks)
-            ranked = sorted(usable, key=lambda u: (u.active, u.connections))
-            sticky = self._sticky.get(host)
-            if sticky and now - sticky[1] < STICKY_SECONDS and sticky[0] in usable:
-                ranked.remove(sticky[0])
-                ranked.insert(0, sticky[0])
-            return ranked
+            return self._ranked(host, time.time() if now is None else now)
+
+    def reserve(self, host: str, tried=()) -> Uplink | None:
+        """Pick the best uplink and count the connection against it at once.
+
+        Choosing and counting must be one atomic step: connections that start
+        in the same instant would otherwise all see "zero open" and pile onto
+        the same link.
+        """
+        with self.lock:
+            ranked = self._ranked(host, time.time(), tried)
+            if not ranked:
+                return None
+            ranked[0].active += 1
+            return ranked[0]
 
     def opened(self, uplink: Uplink, host: str) -> None:
+        """The reserved connection succeeded."""
         with self.lock:
-            uplink.active += 1
             uplink.connections += 1
             uplink.failures = 0
             if len(self._sticky) > 5000:
@@ -156,7 +191,9 @@ class Balancer:
             self._sticky[host] = (uplink, time.time())
 
     def failed(self, uplink: Uplink) -> None:
+        """The reserved connection could not be opened."""
         with self.lock:
+            uplink.active = max(0, uplink.active - 1)
             uplink.failures += 1
             if uplink.failures >= DOWN_AFTER_FAILURES:
                 uplink.down_until = time.time() + DOWN_SECONDS
@@ -170,6 +207,14 @@ class Balancer:
         with self.lock:
             uplink.bytes_down += down
             uplink.bytes_up += up
+            now = time.time()
+            uplink._window_bytes += down + up
+            elapsed = now - uplink._window_start
+            if elapsed >= 1.0:
+                if uplink._window_start and elapsed < 5.0:
+                    rate = uplink._window_bytes / elapsed
+                    uplink.capacity = max(rate, uplink.capacity * (CAPACITY_DECAY ** elapsed))
+                uplink._window_bytes, uplink._window_start = 0, now
 
 
 # ------------------------------------------------------------------ proxy
@@ -363,15 +408,19 @@ class Combiner:
                 return socket.create_connection(address, timeout=10), None
             except OSError:
                 return None, None
-        for uplink in self.balancer.order(host):
+        tried: list[Uplink] = []
+        while True:
+            uplink = self.balancer.reserve(host, tried)
+            if uplink is None:
+                return None, None
             try:
                 sock = socket.create_connection(address, timeout=8, source_address=(uplink.ip, 0))
             except OSError:
                 self.balancer.failed(uplink)
+                tried.append(uplink)
                 continue
             self.balancer.opened(uplink, host)
             return sock, uplink
-        return None, None
 
     def start(self, system_proxy: bool = True, minimum: int = 2, port: int = DEFAULT_PORT) -> dict:
         with self._lock:

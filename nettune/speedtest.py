@@ -24,6 +24,7 @@ MODES = {
 # (name, url template, probe url). {n} is the number of bytes requested.
 DOWNLOAD_SOURCES = [
     ("Cloudflare", "https://speed.cloudflare.com/__down?bytes={n}", "https://speed.cloudflare.com/__down?bytes=20000"),
+    ("Hetzner", "https://fsn1-speed.hetzner.com/100MB.bin", None),
     ("OVH", "https://proof.ovh.net/files/100Mb.dat", None),
     ("Tele2", "http://speedtest.tele2.net/100MB.zip", None),
 ]
@@ -100,15 +101,22 @@ def _measure(meter: _Meter, duration: float, phase: str) -> float:
     return round((end_b - start_b) * 8 / span / 1e6, 2) if span > 0 else 0.0
 
 
-def _download_worker(meter: _Meter, template: str) -> None:
+def _download_worker(meter: _Meter, templates: list[str]) -> None:
+    index = 0
     while not meter.stop.is_set():
         try:
-            with _open(template.format(n=25_000_000)) as response:
+            with _open(templates[index % len(templates)].format(n=10_000_000)) as response:
                 while not meter.stop.is_set():
                     chunk = response.read(65536)
                     if not chunk:
                         break
                     meter.add(len(chunk))
+        except urllib.error.HTTPError:
+            # 429/403: the server is rate-limiting this address (a whole campus
+            # can share one). Move to the next server instead of hammering it.
+            index += 1
+            if meter.stop.wait(0.3):
+                return
         except (OSError, urllib.error.URLError, ssl.SSLError, http.client.HTTPException):
             if meter.stop.wait(0.3):
                 return
@@ -163,10 +171,15 @@ def run(mode: str = "full") -> dict:
             return result
         result["source"], result["ttfb_ms"] = name, ttfb
 
+        templates = [template] + [t for _, t, _ in DOWNLOAD_SOURCES if t != template]
         meter = _Meter(config["down_cap"])
-        result["download_mbps"] = _run_phase(
-            meter, config["down_s"], "download", _download_worker, (meter, template), config["down_streams"])
+        download = _run_phase(
+            meter, config["down_s"], "download", _download_worker, (meter, templates), config["down_streams"])
         result["bytes_down"] = meter.total
+        if meter.total > 0:
+            result["download_mbps"] = download
+        else:
+            result["errors"].append("The speed test servers refused or rate-limited the download test. Try again later.")
 
         upload_errors: list = []
         meter = _Meter(config["up_cap"])
